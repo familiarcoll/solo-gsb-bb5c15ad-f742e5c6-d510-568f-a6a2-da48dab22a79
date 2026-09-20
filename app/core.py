@@ -8,7 +8,9 @@
 """
 from __future__ import annotations
 
+import csv
 import heapq
+import io
 import math
 import re
 from dataclasses import dataclass, field
@@ -1757,4 +1759,282 @@ def external_merge_preview(base_records: list[Swipe],
         base_only=base_only_items,
         import_only=import_only_items,
         merged_text="\n".join(line for _key, line in merged_entries),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 匿名客流 OD 发布（只读：不改记录、配置或账单）
+# ---------------------------------------------------------------------------
+
+# 允许的初始时间桶粒度（分钟）
+OD_BUCKET_CHOICES = (15, 30, 60)
+# 匿名阈值 k 的闭区间
+OD_K_MIN = 2
+OD_K_MAX = 50
+
+# 发布结果中时刻（区间端点）的展示格式：桶长均为整分钟，精确到分
+_OD_TIME_FMT = "%Y-%m-%d %H:%M"
+
+# CSV 列头（同时也是页面表格的口径）
+OD_CSV_HEADER = [
+    "运营日", "进站站点", "出站站点", "区间开始", "区间结束(不含)",
+    "初始桶数", "跨度(分钟)", "行程数", "去重卡数",
+]
+
+# 阻断 OD 发布的错误类型（与耗时审计一致：仅配对 / 时间类）
+_OD_BLOCKING_CODES = {
+    "MISSING_ENTRY", "MISSING_EXIT", "TIME_REVERSED", "DUPLICATE_SWIPE",
+}
+
+
+@dataclass
+class ODPublishResult:
+    """匿名客流 OD 发布结果。
+
+    ok=False 时 errors 为 verify() 的原有定位错误（仅配对 / 时间类错误
+    阻断发布；未知站点、票价缺项不阻断）。ok=True 时 rows 为通过
+    k-匿名判定后可发布的聚合行；suppressed_count 仅给出被抑制
+    「运营日 × OD」单元的数量，不携带任何单元明细；csv_text 为
+    rows 的 CSV 文本（UTF-8，无 BOM，下载端可自行补 BOM）。
+    """
+    ok: bool
+    start_day: str = ""
+    end_day: str = ""
+    bucket_minutes: int = 0
+    k: int = 0
+    trip_count: int = 0          # 参与发布计算的行程总数（所选运营日范围内）
+    cell_count: int = 0          # 非空「运营日 × OD」单元数
+    published_row_count: int = 0
+    published_trip_count: int = 0
+    suppressed_count: int = 0
+    rows: list[dict] = field(default_factory=list)
+    csv_text: str = ""
+    errors: list[dict] = field(default_factory=list)
+
+
+def _parse_day(text: str, label: str) -> tuple[Optional[datetime], Optional[dict]]:
+    """解析运营日文本（严格 YYYY-MM-DD），失败返回 CONFIG_BAD 定位错误。"""
+    if not isinstance(text, str) or not text.strip():
+        return None, _err("CONFIG_BAD", f"{label}必须为 YYYY-MM-DD 格式的日期")
+    text = text.strip()
+    try:
+        d = datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return None, _err("CONFIG_BAD",
+                          f"{label}必须为 YYYY-MM-DD 格式的有效日期：{text!r}")
+    return d, None
+
+
+def _validate_od_params(start_day, end_day, bucket_minutes, k) -> list[dict]:
+    """OD 发布参数校验，非法时给出与其他接口一致的 CONFIG_BAD 错误。"""
+    errors: list[dict] = []
+    start, e1 = _parse_day(start_day, "运营日起始日期")
+    if e1 is not None:
+        errors.append(e1)
+    end, e2 = _parse_day(end_day, "运营日截止日期")
+    if e2 is not None:
+        errors.append(e2)
+    if e1 is None and e2 is None and end < start:
+        errors.append(_err("CONFIG_BAD",
+                           f"运营日截止日期不能早于起始日期"
+                           f"（{start_day} ～ {end_day}）"))
+    if not _is_int_value(bucket_minutes) \
+            or int(bucket_minutes) not in OD_BUCKET_CHOICES:
+        errors.append(_err(
+            "CONFIG_BAD",
+            f"初始时间桶必须为 {'/'.join(map(str, OD_BUCKET_CHOICES))} "
+            f"分钟之一（实际：{bucket_minutes!r}）"))
+    if not _is_int_value(k) or not (OD_K_MIN <= int(k) <= OD_K_MAX):
+        errors.append(_err(
+            "CONFIG_BAD",
+            f"匿名阈值 k 必须为 {OD_K_MIN}～{OD_K_MAX} 之间的整数"
+            f"（实际：{k!r}）"))
+    return errors
+
+
+def _od_day_start(day: str, split_hour: int) -> datetime:
+    """运营日 day 的第一个初始桶起点（day 的 split_hour:00 前推 24h）。"""
+    return datetime.strptime(day, "%Y-%m-%d") + timedelta(
+        hours=split_hour) - timedelta(days=1)
+
+
+def _od_merged_row(day: str, entry_station: str, exit_station: str,
+                   bucket_minutes: int, split_hour: int,
+                   groups: list) -> dict:
+    """把合并后的组列表聚合成一条可发布行（groups 按桶序非空）。
+
+    每组为 (桶下标下界, 桶下标上界, 组内行程列表)；合并会覆盖中间的
+    空桶，最终区间 = 最早桶起点 ～ 最晚桶终点（半开）。
+    """
+    first_idx = groups[0][0]
+    last_idx = groups[-1][1]
+    trips = sum(len(g[2]) for g in groups)
+    cards: set[str] = set()
+    for _lo, _hi, cell_trips in groups:
+        # 行程元组为 (卡号, 进站记录, 出站记录)，报表只取聚合，不留单条信息
+        cards.update(t[0] for t in cell_trips)
+    day_start = _od_day_start(day, split_hour)
+    start_t = day_start + timedelta(minutes=first_idx * bucket_minutes)
+    end_t = day_start + timedelta(minutes=(last_idx + 1) * bucket_minutes)
+    return {
+        "operating_day": day,
+        "entry_station": entry_station,
+        "exit_station": exit_station,
+        "start_time": start_t.strftime(_OD_TIME_FMT),
+        "end_time": end_t.strftime(_OD_TIME_FMT),
+        "bucket_count": last_idx - first_idx + 1,
+        "span_minutes": (last_idx - first_idx + 1) * bucket_minutes,
+        "trip_count": trips,
+        "card_count": len(cards),
+        "_start_dt": start_t,
+    }
+
+
+def _od_rows_to_csv(rows: list[dict]) -> str:
+    """聚合行 -> CSV 文本（RFC 4180 风格的最小转义；CRLF 行尾）。"""
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(OD_CSV_HEADER)
+    for r in rows:
+        writer.writerow([
+            r["operating_day"], r["entry_station"], r["exit_station"],
+            r["start_time"], r["end_time"], r["bucket_count"],
+            r["span_minutes"], r["trip_count"], r["card_count"],
+        ])
+    return buf.getvalue()
+
+
+def od_publish(stations: list[Station],
+               fares: list[Fare],
+               records: list[Swipe],
+               cfg: Config,
+               start_day: str,
+               end_day: str,
+               bucket_minutes,
+               k) -> ODPublishResult:
+    """匿名客流 OD 发布（全程只读：不改记录、配置，也不写/清空账单）。
+
+    仅从**可完整配对**的已保存记录生成「进站 → 出站」聚合；配对 /
+    时间类错误（MISSING_ENTRY / MISSING_EXIT / TIME_REVERSED /
+    DUPLICATE_SWIPE）按 verify() 的原有定位错误返回，不产出任何报表；
+    未知站点与票价缺项不阻断（OD 只依赖站点名与配对结构）。
+
+    口径：
+    - 行程按**进站时刻**归属运营日，仅统计运营日落在
+      [start_day, end_day] 闭区间内的行程；
+    - 桶按运营日对齐（以运营日分界点 split_hour:00 为起点），初始桶长
+      15 / 30 / 60 分钟；每个「运营日 × 进站站点 → 出站站点」单元内，
+      以**去重卡数**判定匿名性，行程数为该区间内全部行程笔数；
+    - 低于 k 的非空桶反复与同一单元内相邻的非空桶合并：始终从
+      **最早的不足 k 组**开始处理，每步优先并入合并后跨度更小的邻桶，
+      跨度相同则并入更早的邻桶（多组并存时固定的处理次序使结果与记录
+      顺序无关、完全确定）；**禁止跨运营日、跨 OD 合并**；已无相邻非空桶、
+      合并后去重卡数仍不足 k 的单元整体抑制，只计入 suppressed_count；
+    - 发布内容只含聚合（最终区间、初始桶数 / 跨度、行程数、去重卡数），
+      不含卡号、原始行号或任何单条时刻。
+    """
+    errors = _validate_od_params(start_day, end_day, bucket_minutes, k)
+    if errors:
+        return ODPublishResult(ok=False, errors=errors)
+    bucket_minutes = int(bucket_minutes)
+    k = int(k)
+
+    result = verify(stations, fares, records, cfg)
+    if not result.ok:
+        blocking = [e for e in result.errors
+                    if e.get("code") in _OD_BLOCKING_CODES]
+        if blocking:
+            # 配对 / 时间类错误：原有定位错误原样返回，不生成报表
+            return ODPublishResult(ok=False, errors=result.errors)
+
+    # 运营日 -> (进站, 出站) -> {桶下标: [该桶内的行程(卡号, 进站, 出站)]}
+    # 仅收集所选运营日闭区间内的行程。
+    by_cell: dict[tuple[str, str, str], dict[int, list]] = {}
+    trip_total = 0
+    for card, _seq, sw_in, sw_out in result.trips:
+        day = operating_day(sw_in.t, cfg.day_split_hour)
+        if not (start_day <= day <= end_day):
+            continue
+        trip_total += 1
+        day_start = _od_day_start(day, cfg.day_split_hour)
+        idx = int((sw_in.t - day_start).total_seconds()
+                  // (bucket_minutes * 60))
+        key = (day, sw_in.station, sw_out.station)
+        by_cell.setdefault(key, {}).setdefault(idx, []).append(
+            (card, sw_in, sw_out))
+
+    rows: list[dict] = []
+    suppressed = 0
+    for (day, entry_station, exit_station), raw_buckets in sorted(by_cell.items()):
+        # 每个非空桶初始为一个组：(桶下界, 桶上界, 行程列表, 去重卡号集合)
+        groups = [[idx, idx, trips, {t[0] for t in trips}]
+                  for idx, trips in sorted(raw_buckets.items())]
+
+        # 反复取**最早的**去重卡数不足 k 的组（按下界，再按行程数稳定）
+        # 与相邻「非空桶组」合并。当同一单元内存在多个不足 k 的组时，
+        # 固定从最早的不足组开始处理，保证结果与记录顺序无关、完全确定。
+        # 相邻指非空桶序列中的前 / 后组（中间空桶不计行程，但计入跨度）；
+        # 每一步优先并入合并后跨度更小的邻桶，跨度相同取更早邻桶。
+        # 合并会不断消耗邻组：不足组最终要么达标，要么成为单元内唯一组。
+        while True:
+            under = min(
+                (g for g in groups if len(g[3]) < k),
+                key=lambda g: (g[0], len(g[2])),
+                default=None)
+            if under is None:
+                break
+            pos = groups.index(under)
+            left = groups[pos - 1] if pos > 0 else None
+            right = groups[pos + 1] if pos + 1 < len(groups) else None
+            if left is None and right is None:
+                # 已无相邻非空桶（该单元仅剩此组），仍不足 k：整体抑制
+                break
+            candidates = [g for g in (left, right) if g is not None]
+            target = min(
+                candidates,
+                key=lambda g: (
+                    max(under[1], g[1]) - min(under[0], g[0]) + 1,
+                    g[0],
+                ))
+            merged = [
+                min(under[0], target[0]),
+                max(under[1], target[1]),
+                under[2] + target[2],
+                under[3] | target[3],
+            ]
+            groups = [g for g in groups
+                      if g is not under and g is not target]
+            groups.append(merged)
+            groups.sort(key=lambda g: g[0])
+
+        if len(groups) == 1 and len(groups[0][3]) < k:
+            # 整个运营日 × OD 单元合并到底仍不足 k：抑制，只计数，
+            # 不保留任何可辨识该单元的信息。
+            suppressed += 1
+            continue
+
+        row_groups = [(g[0], g[1], g[2]) for g in groups]
+        rows.append(_od_merged_row(
+            day, entry_station, exit_station, bucket_minutes,
+            cfg.day_split_hour, row_groups))
+
+    rows.sort(key=lambda r: (r["operating_day"], r["_start_dt"],
+                             r["entry_station"], r["exit_station"]))
+    published_trips = sum(r["trip_count"] for r in rows)
+    for r in rows:
+        del r["_start_dt"]
+
+    return ODPublishResult(
+        ok=True,
+        start_day=start_day,
+        end_day=end_day,
+        bucket_minutes=bucket_minutes,
+        k=k,
+        trip_count=trip_total,
+        cell_count=len(by_cell),
+        published_row_count=len(rows),
+        published_trip_count=published_trips,
+        suppressed_count=suppressed,
+        rows=rows,
+        csv_text=_od_rows_to_csv(rows),
     )

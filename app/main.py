@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import db
@@ -16,6 +16,7 @@ from .core import (
     duration_audit,
     external_merge_preview,
     fare_path_audit,
+    od_publish,
     parse_fares_text,
     parse_records_text,
     parse_stations_text,
@@ -28,6 +29,7 @@ from .core import (
 from .schemas import (
     ConfigIn,
     MergePreviewIn,
+    ODPublishIn,
     PeakAuditIn,
     TextIn,
     TrialConfigIn,
@@ -46,7 +48,7 @@ app = FastAPI(
     title="公交刷卡票价核验台",
     description="录入站点分区、票价矩阵、换乘抵扣、每日封顶与刷卡记录，"
                 "按卡号配对进出站并核验计价。",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -435,6 +437,90 @@ def run_external_merge_preview(body: MergePreviewIn):
         "import_only": result.import_only,
         "merged_text": result.merged_text,
     }
+
+
+# ---------------------------------------------------------------------------
+# 匿名客流 OD 发布（只读：不改记录、配置或账单）
+# ---------------------------------------------------------------------------
+
+def _run_od_publish(start_day: str, end_day: str, bucket_minutes, k):
+    """读取已保存数据并执行 OD 发布；返回 ODPublishResult（纯只读）。"""
+    with db.connect() as conn:
+        cfg = db.get_config(conn)
+        stations, fares, records = db.load_domain(conn)
+        return od_publish(stations, fares, records, cfg,
+                          start_day, end_day, bucket_minutes, k)
+
+
+@app.post("/api/od-publish")
+def run_od_publish(body: ODPublishIn):
+    """对已保存且可完整配对的记录生成匿名客流 OD 聚合。
+
+    - 仅统计运营日落在 [start_day, end_day] 闭区间内的已配对行程，
+      初始时间桶按运营日对齐、取 15 / 30 / 60 分钟，每个「运营日 ×
+      进站 → 出站」单元以去重卡数判定 k-匿名（k 取 2～50）；
+    - 低于 k 的非空桶反复与同单元相邻非空桶合并（优先并入合并后跨度
+      更小者，同分取更早邻桶），禁止跨运营日 / 跨 OD 合并；合并到底
+      仍不足 k 的单元整体抑制，只返回抑制数量；
+    - 发布内容只含聚合区间、行程数与去重卡数，不含卡号、原始行号或
+      单条时刻；csv_text 为可直接导出的 CSV 文本；
+    - 配对 / 时间类错误沿用 verify() 的原有定位错误返回（422），
+      不产出报表；未知站点与票价缺项不阻断发布；
+    - 全程只读：不修改记录、配置，也不写入或清空账单。
+    """
+    result = _run_od_publish(
+        body.start_day, body.end_day, body.bucket_minutes, body.k)
+    if not result.ok:
+        return JSONResponse(
+            status_code=422,
+            content={"ok": False, "errors": result.errors})
+
+    return {
+        "ok": True,
+        "start_day": result.start_day,
+        "end_day": result.end_day,
+        "bucket_minutes": result.bucket_minutes,
+        "k": result.k,
+        "trip_count": result.trip_count,
+        "cell_count": result.cell_count,
+        "published_row_count": result.published_row_count,
+        "published_trip_count": result.published_trip_count,
+        "suppressed_count": result.suppressed_count,
+        "rows": result.rows,
+        "csv_text": result.csv_text,
+    }
+
+
+@app.get("/api/od-publish.csv")
+def export_od_publish_csv(start_day: str, end_day: str,
+                          bucket_minutes: str, k: str):
+    """OD 发布的 CSV 直链导出（参数同 POST，结果与之一致）。
+
+    成功返回 text/csv（UTF-8，带 BOM 以便 Excel 直接打开）；
+    参数非法或存在配对 / 时间类错误时返回 422 + JSON 错误数组，
+    不产出 CSV。全程只读。
+    """
+    def as_number(text: str):
+        try:
+            return int(text)
+        except (TypeError, ValueError):
+            return text  # 原样交给核心层，产出 CONFIG_BAD
+
+    result = _run_od_publish(
+        start_day, end_day,
+        as_number(bucket_minutes), as_number(k))
+    if not result.ok:
+        return JSONResponse(
+            status_code=422,
+            content={"ok": False, "errors": result.errors})
+
+    filename = (f"od_publish_{result.start_day}_to_{result.end_day}_"
+                f"{result.bucket_minutes}min_k{result.k}.csv")
+    return Response(
+        content="﻿" + result.csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition":
+                 f'attachment; filename="{filename}"'})
 
 
 @app.get("/api/health")

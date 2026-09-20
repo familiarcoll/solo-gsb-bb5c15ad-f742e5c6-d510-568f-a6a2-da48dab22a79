@@ -465,6 +465,66 @@ X999, 2026-09-18 08:10:00, 中心公园, 进"></textarea>
       </div>
     </section>
 
+    <!-- 匿名客流 OD 发布 -->
+    <section class="card" id="sec-od">
+      <h2>12. 匿名客流 OD 发布</h2>
+      <p class="hint">仅从<strong>可完整配对</strong>的已保存记录生成「进站 → 出站」客流聚合。选择
+        <strong>运营日起止范围</strong>、<strong>15 / 30 / 60 分钟初始时间桶</strong>与匿名阈值
+        <strong>k（2～50）</strong>：每个运营日、每条 OD 内以<strong>去重卡数</strong>判定；始终从
+        <strong>最早的不足 k 桶</strong>开始，反复与<strong>前后相邻的非空桶</strong>合并（优先并入合并后跨度更小者，
+        跨度相同并入更早邻桶，结果与录入顺序无关），<strong>禁止跨运营日、跨 OD 合并</strong>；
+        合并到底仍不足 k 的单元<strong>整体抑制</strong>。
+        发布内容只含最终区间、初始桶数 / 跨度、行程数与去重卡数，<strong>不含卡号、原始行号或单条时刻</strong>；
+        被抑制的单元只报告数量。配对 / 时间类错误（缺失进出站、时间逆序、重复刷卡）沿用原有定位错误、
+        <strong>不产出报表</strong>；未知站点与票价缺项不阻断。发布<strong>全程只读</strong>：
+        不修改记录、配置或账单。</p>
+      <div class="form-grid">
+        <label>运营日起始（含，YYYY-MM-DD）
+          <input type="date" id="od-start" />
+        </label>
+        <label>运营日截止（含，YYYY-MM-DD）
+          <input type="date" id="od-end" />
+        </label>
+        <label>初始时间桶（分钟）
+          <select id="od-bucket">
+            <option value="15">15 分钟</option>
+            <option value="30">30 分钟</option>
+            <option value="60">60 分钟</option>
+          </select>
+        </label>
+        <label>匿名阈值 k（2～50，按去重卡数）
+          <input type="number" id="od-k" min="2" max="50" value="5" />
+        </label>
+      </div>
+      <div class="row-actions">
+        <button class="btn btn-primary" id="btn-od" type="button">🛡 生成匿名 OD 发布</button>
+        <button class="btn btn-save" id="btn-od-csv" type="button" hidden>⬇ 导出 CSV</button>
+        <span id="od-status" class="status"></span>
+      </div>
+
+      <div id="od-errors" class="errors-panel" hidden>
+        <h3>❌ 无法生成 OD 发布 —— 存在以下错误（记录、配置与账单均未改动，未产出任何报表）</h3>
+        <ul id="od-errors-list"></ul>
+      </div>
+
+      <div id="od-result" class="audit-result" hidden>
+        <div id="od-summary" class="audit-summary"></div>
+        <div class="table-wrap">
+          <table id="od-table">
+            <thead>
+              <tr>
+                <th>运营日</th><th>进站站点</th><th>出站站点</th>
+                <th>区间开始</th><th>区间结束（不含）</th>
+                <th>初始桶数</th><th>跨度(分钟)</th>
+                <th>行程数</th><th>去重卡数</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <footer class="footer">
       FastAPI + SQLite + 原生前端 · 数据保存在容器 /data 卷 ·
       <a href="/docs" target="_blank">API 文档</a>

@@ -1079,6 +1079,122 @@ function copyMergedText() {
     `已复制 ${lastMergedText.split("\n").length} 行合并文本（仍未保存，可粘贴到记录区核对）`);
 }
 
+/* ---------------- 12. 匿名客流 OD 发布（只读） ---------------- */
+
+let lastODParams = null;
+
+function renderODErrors(errors) {
+  const ul = $("od-errors-list");
+  ul.innerHTML = "";
+  for (const e of errors) ul.appendChild(renderErrorLi(e));
+  $("od-errors").hidden = false;
+  $("od-result").hidden = true;
+  $("btn-od-csv").hidden = true;
+}
+
+function renderODPublish(data) {
+  $("od-errors").hidden = true;
+  $("od-result").hidden = false;
+
+  const rows = data.rows || [];
+  const emptyNote = rows.length === 0
+    ? "所选范围内没有任何单元达到匿名阈值，<strong>无对外发布行</strong>。"
+    : `可发布聚合行 <strong>${rows.length}</strong> 行，覆盖行程 ` +
+      `<strong>${data.published_trip_count}</strong> 笔。`;
+  $("od-summary").innerHTML =
+    `运营日 <strong>${data.start_day}</strong> ～ <strong>${data.end_day}</strong>` +
+    `（含两端）· 初始桶 <strong>${data.bucket_min}</strong> 分钟 · ` +
+    `匿名阈值 k=<strong>${data.k}</strong>：范围内配对行程 ` +
+    `<strong>${data.trip_count}</strong> 笔，共 <strong>${data.cell_count}</strong> ` +
+    `个「运营日 × OD」非空单元；${emptyNote}` +
+    `另有 <strong>${data.suppressed_count}</strong> 个单元合并后仍不足 k，` +
+    `已整体抑制（<strong>仅报告数量</strong>，不含卡号、行号或时刻）。<br>` +
+    `<span class="sub">桶按运营日分界时刻对齐，区间为半开 [开始, 结束)；` +
+    `合并只在同一运营日、同一 OD 内的相邻非空桶间进行。发布全程只读：` +
+    `记录、配置与账单均未改动。</span>`;
+
+  const tb = $("od-table").querySelector("tbody");
+  tb.innerHTML = "";
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${r.operating_day}</td>
+      <td>${escapeHtml(r.entry_station)}</td>
+      <td>${escapeHtml(r.exit_station)}</td>
+      <td>${r.start_time}</td>
+      <td>${r.end_time}</td>
+      <td class="num">${r.bucket_count}</td>
+      <td class="num">${r.span_minutes}</td>
+      <td class="num charge">${r.trip_count}</td>
+      <td class="num">${r.card_count}</td>`;
+    tb.appendChild(tr);
+  }
+  $("btn-od-csv").hidden = rows.length === 0;
+}
+
+async function runODPublish() {
+  const status = $("od-status");
+  const body = {
+    start_day: $("od-start").value,
+    end_day: $("od-end").value,
+    bucket_minutes: Number($("od-bucket").value),
+    k: Number($("od-k").value),
+  };
+  if (!body.start_day || !body.end_day) {
+    status.textContent = "请选择运营日起始与截止日期";
+    status.className = "status bad";
+    return;
+  }
+  if (!Number.isFinite(body.k) || body.k < 2 || body.k > 50) {
+    status.textContent = "匿名阈值 k 必须为 2～50 的整数";
+    status.className = "status bad";
+    return;
+  }
+  lastODParams = body;
+  status.textContent = "聚合中…";
+  status.className = "status";
+  $("od-errors").hidden = true;
+  $("od-result").hidden = true;
+  $("btn-od-csv").hidden = true;
+  try {
+    const data = await api("/api/od-publish", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    renderODPublish(data);
+    status.textContent =
+      `发布生成：${data.published_row_count} 行可发布，` +
+      `${data.suppressed_count} 个单元被抑制（只读，数据均未改动）`;
+    status.className = "status ok";
+    toast("匿名 OD 发布已生成（只读，未保存任何改动）");
+  } catch (e) {
+    const errors = (e.payload && e.payload.errors) || [];
+    if (errors.length) {
+      renderODErrors(errors);
+      status.textContent =
+        errors[0] && errors[0].code === "CONFIG_BAD"
+          ? "参数不合法，未生成 OD 发布"
+          : `存在 ${errors.length} 个配对 / 时间类错误，未产出报表（数据均未改动）`;
+    } else {
+      status.textContent = summaryError(e, "OD 发布请求失败");
+    }
+    status.className = "status bad";
+    toast("无法生成 OD 发布", false);
+  }
+}
+
+function exportODCsv() {
+  if (!lastODParams) return;
+  const q = new URLSearchParams({
+    start_day: lastODParams.start_day,
+    end_day: lastODParams.end_day,
+    bucket_minutes: String(lastODParams.bucket_minutes),
+    k: String(lastODParams.k),
+  });
+  // 直链导出：服务端按与发布完全一致的参数重算 CSV（GET，只读）
+  window.location.href = "/api/od-publish.csv?" + q.toString();
+}
+
 /* ---------------- 演示数据 ---------------- */
 
 const DEMO = {
@@ -1188,6 +1304,8 @@ function bind() {
   $("btn-copy-suggests").addEventListener("click", copyAllSuggests);
   $("btn-merge").addEventListener("click", runMergePreview);
   $("btn-merge-copy").addEventListener("click", copyMergedText);
+  $("btn-od").addEventListener("click", runODPublish);
+  $("btn-od-csv").addEventListener("click", exportODCsv);
   $("btn-verify").addEventListener("click", runVerify);
   $("btn-verify-top").addEventListener("click", runVerify);
   $("btn-demo").addEventListener("click", loadDemo);
@@ -1195,6 +1313,9 @@ function bind() {
 
 async function init() {
   bind();
+  // OD 发布默认运营日范围（演示数据为 2026-09-18 ～ 2026-09-19）
+  $("od-start").value = "2026-09-18";
+  $("od-end").value = "2026-09-19";
   try {
     const cfg = await loadConfig();
     fillTrialInputs(cfg);
