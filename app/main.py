@@ -16,6 +16,7 @@ from .core import (
     duration_audit,
     external_merge_preview,
     fare_path_audit,
+    od_flow_publish,
     parse_fares_text,
     parse_records_text,
     parse_stations_text,
@@ -28,6 +29,7 @@ from .core import (
 from .schemas import (
     ConfigIn,
     MergePreviewIn,
+    OdPublishIn,
     PeakAuditIn,
     TextIn,
     TrialConfigIn,
@@ -46,7 +48,7 @@ app = FastAPI(
     title="公交刷卡票价核验台",
     description="录入站点分区、票价矩阵、换乘抵扣、每日封顶与刷卡记录，"
                 "按卡号配对进出站并核验计价。",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -434,6 +436,53 @@ def run_external_merge_preview(body: MergePreviewIn):
         "base_only": result.base_only,
         "import_only": result.import_only,
         "merged_text": result.merged_text,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 匿名客流 OD 发布（只读：不改记录、配置或账单）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/od-flow-publish")
+def run_od_flow_publish(body: OdPublishIn):
+    """对已保存且可完整配对的记录生成匿名进站→出站客流聚合。
+
+    - 用户选择运营日起止（闭区间）、15/30/60 分钟初始时间桶与匿名
+      阈值 k（2～50）；每个运营日、OD 内以去重卡数判定；
+    - 低于 k 的非空桶反复与前后相邻非空桶合并（优先合并后跨度更小者，
+      同分选更早邻桶），禁止跨运营日或跨 OD 合并；已无邻桶仍不足 k
+      则抑制，抑制项只报数量；
+    - 配对 / 时间类错误与参数非法（CONFIG_BAD）沿用原有定位错误返回，
+      不产出报表；未知站点与票价缺项不阻断；
+    - 全程只读：不修改记录、配置，也不写入或清空账单。
+    """
+    with db.connect() as conn:
+        cfg = db.get_config(conn)
+        stations, fares, records = db.load_domain(conn)
+        result = od_flow_publish(
+            stations, fares, records, cfg,
+            body.start_day, body.end_day,
+            body.bucket_minutes, body.k)
+
+    if not result.ok:
+        return JSONResponse(
+            status_code=422,
+            content={"ok": False, "errors": result.errors})
+
+    return {
+        "ok": True,
+        "start_day": result.start_day,
+        "end_day": result.end_day,
+        "bucket_minutes": result.bucket_minutes,
+        "k": result.k,
+        "day_split_hour": result.day_split_hour,
+        "trip_count": result.trip_count,
+        "day_count": result.day_count,
+        "od_count": result.od_count,
+        "row_count": result.row_count,
+        "suppressed_bucket_count": result.suppressed_bucket_count,
+        "suppressed_trip_count": result.suppressed_trip_count,
+        "rows": result.rows,
     }
 
 

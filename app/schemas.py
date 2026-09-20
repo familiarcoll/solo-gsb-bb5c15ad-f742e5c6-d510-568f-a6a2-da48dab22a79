@@ -50,3 +50,17 @@ class MergePreviewIn(BaseModel):
     text: str = Field(default="", description="待导入刷卡记录文本")
     tolerance_seconds: float = Field(
         description="重复判定时间容差（秒），取 0～120 的整数")
+
+
+class OdPublishIn(BaseModel):
+    """匿名客流 OD 发布参数。
+
+    不在此处做数值约束：非法参数应走核心层校验，
+    返回与其他接口一致的 CONFIG_BAD 定位错误（HTTP 422）。
+    """
+    start_day: str = Field(description="运营日起始日期 YYYY-MM-DD（闭区间）")
+    end_day: str = Field(description="运营日结束日期 YYYY-MM-DD（闭区间）")
+    bucket_minutes: float = Field(
+        description="初始时间桶粒度（分钟），取 15 / 30 / 60 之一")
+    k: float = Field(
+        description="匿名阈值：每个发布区间内的去重卡数下限，取 2～50 的整数")

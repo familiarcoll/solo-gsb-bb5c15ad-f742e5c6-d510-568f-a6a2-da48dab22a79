@@ -1079,6 +1079,173 @@ function copyMergedText() {
     `已复制 ${lastMergedText.split("\n").length} 行合并文本（仍未保存，可粘贴到记录区核对）`);
 }
 
+/* ---------------- 12. 匿名客流 OD 发布（只读） ---------------- */
+
+let lastOdRows = [];
+let lastOdMeta = null;
+
+function renderOdErrors(errors) {
+  const ul = $("od-errors-list");
+  ul.innerHTML = "";
+  for (const e of errors) ul.appendChild(renderErrorLi(e));
+  $("od-errors").hidden = false;
+  $("od-result").hidden = true;
+  $("btn-od-csv").hidden = true;
+}
+
+function renderOdPublish(data) {
+  $("od-errors").hidden = true;
+  $("od-result").hidden = false;
+  $("btn-od-csv").hidden = data.row_count === 0;
+  lastOdRows = data.rows || [];
+  lastOdMeta = data;
+
+  const suppressNote = data.suppressed_bucket_count
+    ? `因合并后仍不足 k 且已无相邻非空桶，共抑制 <strong>${data.suppressed_bucket_count}</strong> ` +
+      `个初始非空桶（涉及 <strong>${data.suppressed_trip_count}</strong> 笔行程，` +
+      `仅公布数量，不含任何明细）。`
+    : "没有区间被抑制。";
+  $("od-summary").innerHTML =
+    `运营日 <strong>${data.start_day} ～ ${data.end_day}</strong>（分界 ${data.day_split_hour}:00）· ` +
+    `初始桶 <strong>${data.bucket_minutes}</strong> 分钟 · 匿名阈值 ` +
+    `<strong>k=${data.k}</strong>：范围内共 <strong>${data.trip_count}</strong> 笔行程 / ` +
+    `<strong>${data.od_count}</strong> 个 OD / <strong>${data.day_count}</strong> 个运营日，` +
+    `发布 <strong>${data.row_count}</strong> 个匿名区间。<br>` +
+    `${suppressNote}<br>` +
+    `<span class="sub">每个区间去重卡数 ≥ k；仅输出区间、行程数与去重卡数，` +
+    `不包含卡号、原始行号或单条时刻；发布全程只读，记录 / 配置 / 账单均未改动。</span>`;
+
+  const tb = $("od-table").querySelector("tbody");
+  tb.innerHTML = "";
+  for (const r of lastOdRows) {
+    const tr = document.createElement("tr");
+    const merged = r.merged_buckets > 1
+      ? `<span class="od-merged-tag">${r.merged_buckets} 桶合并</span>`
+      : "1";
+    tr.innerHTML = `
+      <td>${r.operating_day}</td>
+      <td>${escapeHtml(r.entry_station)}</td>
+      <td>${escapeHtml(r.exit_station)}</td>
+      <td>${r.start_time}</td>
+      <td>${r.end_time}</td>
+      <td class="num">${r.span_minutes}</td>
+      <td class="num">${merged}</td>
+      <td class="num charge">${r.trip_count}</td>
+      <td class="num">${r.card_count}</td>`;
+    tb.appendChild(tr);
+  }
+  if (!lastOdRows.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td colspan="9" class="od-empty">所选运营日范围内没有可发布的行程（或全部区间已被抑制）。</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+async function runOdPublish() {
+  const status = $("od-status");
+  const body = {
+    start_day: $("od-start").value,
+    end_day: $("od-end").value,
+    bucket_minutes: Number($("od-bucket").value),
+    k: Number($("od-k").value),
+  };
+  if (!body.start_day || !body.end_day) {
+    status.textContent = "请先选择运营日起止日期";
+    status.className = "status bad";
+    return;
+  }
+  if (!Number.isFinite(body.k)) {
+    status.textContent = "匿名阈值 k 必须填写为 2～50 的整数";
+    status.className = "status bad";
+    return;
+  }
+  status.textContent = "聚合发布中…";
+  status.className = "status";
+  $("od-errors").hidden = true;
+  $("od-result").hidden = true;
+  $("btn-od-csv").hidden = true;
+  try {
+    const data = await api("/api/od-flow-publish", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    renderOdPublish(data);
+    status.textContent =
+      `发布完成：${data.row_count} 个匿名区间，抑制 ${data.suppressed_bucket_count} 桶` +
+      "（只读，记录 / 配置 / 账单均未改动）";
+    status.className = "status ok";
+    toast("匿名 OD 发布已生成（只读，未保存任何改动）");
+  } catch (e) {
+    const errors = (e.payload && e.payload.errors) || [];
+    if (errors.length) {
+      renderOdErrors(errors);
+      status.textContent =
+        errors[0] && errors[0].code === "CONFIG_BAD"
+          ? "参数不合法，未生成发布结果"
+          : `存在 ${errors.length} 个配对 / 时间类错误，未生成发布结果（数据均未改动）`;
+    } else {
+      status.textContent = summaryError(e, "OD 发布请求失败");
+    }
+    status.className = "status bad";
+    toast("无法生成匿名 OD 发布", false);
+  }
+}
+
+function odCsvCell(v) {
+  let s = String(v);
+  // 防止表格软件把以 = + - @ 开头的值解析为公式（CSV 注入）
+  if (/^[=+\-@]/.test(s)) s = "\t" + s;
+  if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function buildOdCsv(data) {
+  const header = [
+    "运营日", "进站站点", "出站站点", "区间开始", "区间结束(不含)",
+    "区间跨度(分)", "初始桶(分)", "合并桶数", "行程数", "去重卡数",
+  ];
+  const lines = [header.map(odCsvCell).join(",")];
+  for (const r of data.rows || []) {
+    lines.push([
+      r.operating_day, r.entry_station, r.exit_station,
+      r.start_time, r.end_time, r.span_minutes, r.bucket_minutes,
+      r.merged_buckets, r.trip_count, r.card_count,
+    ].map(odCsvCell).join(","));
+  }
+  // 报表头行只汇总抑制数量，不含任何卡号 / 行号 / 单条时刻明细
+  lines.push("");
+  lines.push(`# 运营日范围,${odCsvCell(`${data.start_day} ～ ${data.end_day}`)}`);
+  lines.push(`# 初始桶(分钟),${data.bucket_minutes}`);
+  lines.push(`# 匿名阈值k,${data.k}`);
+  lines.push(`# 运营日分界(点),${data.day_split_hour}`);
+  lines.push(`# 范围内行程数,${data.trip_count}`);
+  lines.push(`# 发布区间数,${data.row_count}`);
+  lines.push(`# 被抑制初始非空桶数(仅数量),${data.suppressed_bucket_count}`);
+  lines.push(`# 被抑制行程数(仅数量),${data.suppressed_trip_count}`);
+  return lines.join("\r\n");
+}
+
+function exportOdCsv() {
+  if (!lastOdMeta || !lastOdRows.length) {
+    toast("暂无可导出的发布结果", false);
+    return;
+  }
+  const csv = buildOdCsv(lastOdMeta);
+  // UTF-8 BOM，便于 Excel 直接识别中文编码
+  const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `od_flow_${lastOdMeta.start_day}_${lastOdMeta.end_day}_` +
+    `${lastOdMeta.bucket_minutes}min_k${lastOdMeta.k}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast(`已导出 ${lastOdRows.length} 个发布区间（CSV 仅含聚合数据）`);
+}
+
 /* ---------------- 演示数据 ---------------- */
 
 const DEMO = {
@@ -1188,6 +1355,8 @@ function bind() {
   $("btn-copy-suggests").addEventListener("click", copyAllSuggests);
   $("btn-merge").addEventListener("click", runMergePreview);
   $("btn-merge-copy").addEventListener("click", copyMergedText);
+  $("btn-od-publish").addEventListener("click", runOdPublish);
+  $("btn-od-csv").addEventListener("click", exportOdCsv);
   $("btn-verify").addEventListener("click", runVerify);
   $("btn-verify-top").addEventListener("click", runVerify);
   $("btn-demo").addEventListener("click", loadDemo);
@@ -1195,6 +1364,13 @@ function bind() {
 
 async function init() {
   bind();
+  // 默认把运营日起止填为今天（本地时区），用户可自行调整
+  const today = new Date();
+  const yyyy = today.getFullYear();
+  const mm = String(today.getMonth() + 1).padStart(2, "0");
+  const dd = String(today.getDate()).padStart(2, "0");
+  $("od-start").value = `${yyyy}-${mm}-${dd}`;
+  $("od-end").value = `${yyyy}-${mm}-${dd}`;
   try {
     const cfg = await loadConfig();
     fillTrialInputs(cfg);

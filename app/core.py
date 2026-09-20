@@ -1758,3 +1758,262 @@ def external_merge_preview(base_records: list[Swipe],
         import_only=import_only_items,
         merged_text="\n".join(line for _key, line in merged_entries),
     )
+
+
+# ---------------------------------------------------------------------------
+# 匿名客流 OD 发布（只读：不改记录、配置或账单）
+# ---------------------------------------------------------------------------
+
+# 初始时间桶可选粒度（分钟，按自然日整点对齐）
+OD_BUCKET_CHOICES = (15, 30, 60)
+# 匿名阈值 k 的合法范围（每个发布区间内的去重卡数下限）
+OD_K_MIN = 2
+OD_K_MAX = 50
+OD_DAY_FMT = "%Y-%m-%d"
+OD_TIME_FMT = "%Y-%m-%d %H:%M:%S"
+
+# 阻断发布的错误：配对 / 时间类错误与参数非法（CONFIG_BAD）。
+# 未知站点（UNKNOWN_STATION）与票价缺项（MISSING_FARE）不阻断：
+# OD 聚合只依赖配对后的行程与站点名，与站点分区、票价无关。
+_OD_PUBLISH_BLOCKING_CODES = _DURATION_BLOCKING_CODES | {"CONFIG_BAD"}
+
+
+@dataclass
+class OdFlowPublish:
+    """匿名客流 OD 发布结果。
+
+    参数非法（运营日起止格式 / 顺序错误、时间桶不在 15/30/60、
+    k 不是 2～50 的整数），或存在配对 / 时间类数据错误时 ok=False，
+    errors 携带原有定位错误（CONFIG_BAD 或 verify() 的定位错误），
+    不产出任何报表。
+    ok=True 时 rows 为通过 k-匿名抑制后的最终发布区间（按运营日、
+    OD、区间起点稳定排序），suppressed_* 仅给出被抑制桶 / 行程的
+    汇总数量，不含任何卡号、原始行号或单条时刻。
+    """
+    ok: bool
+    start_day: str = ""
+    end_day: str = ""
+    bucket_minutes: int = 0
+    k: int = 0
+    day_split_hour: int = 0
+    trip_count: int = 0
+    day_count: int = 0
+    od_count: int = 0
+    row_count: int = 0
+    suppressed_bucket_count: int = 0
+    suppressed_trip_count: int = 0
+    rows: list[dict] = field(default_factory=list)
+    errors: list[dict] = field(default_factory=list)
+
+
+def _parse_od_day(value, label: str) -> tuple[Optional[str], Optional[dict]]:
+    """解析运营日参数（YYYY-MM-DD）；失败返回 CONFIG_BAD 定位错误。"""
+    text = str(value).strip()
+    try:
+        datetime.strptime(text, OD_DAY_FMT)
+    except (ValueError, TypeError):
+        return None, _err(
+            "CONFIG_BAD",
+            f"运营日{label}必须是 YYYY-MM-DD 格式的日期：{value!r}")
+    return text, None
+
+
+def _od_bucket_start(t: datetime, bucket_minutes: int) -> datetime:
+    """进站时刻所属初始时间桶的起点。
+
+    按自然日 00:00 整点对齐到 bucket_minutes 网格（半开区间
+    [起点, 起点 + 桶长)）；运营日归属与桶网格相互独立，跨运营日
+    分界的凌晨时段由分组键（运营日）隔离，不会与当日同名桶混淆。
+    """
+    midnight = t.replace(hour=0, minute=0, second=0, microsecond=0)
+    idx = (t.hour * 60 + t.minute) // bucket_minutes
+    return midnight + timedelta(minutes=idx * bucket_minutes)
+
+
+def _merge_od_buckets(components: list[dict], k: int
+                      ) -> tuple[list[dict], int, int]:
+    """单个（运营日, OD）分组内的 k-匿名桶合并 / 抑制。
+
+    components 已按起点升序，每项为
+    {start, end, cards: set, trips, buckets}，仅含非空初始桶；
+    buckets 为该存活组件覆盖的初始非空桶数（用于抑制数量统计）。
+    反复取最靠左的去重卡数 < k 的桶：
+      - 与左 / 右相邻存活桶合并，选择**合并后跨度更小**者；
+        跨度相同时选更早的左邻桶；
+      - 左右均无邻桶（整组仅剩自身仍不足 k）时抑制（删除）该组件。
+    合并后去重卡数取并集、行程数与初始桶数相加，并重新参与下一轮判定。
+    本函数只处理单个分组，因此不可能跨运营日或跨 OD 合并。
+
+    返回 (存活区间列表, 被抑制的初始桶数, 被抑制的行程数)。
+    """
+    comps = [{"start": c["start"], "end": c["end"],
+              "cards": set(c["cards"]), "trips": c["trips"],
+              "buckets": c["buckets"]}
+             for c in components]
+    suppressed_buckets = 0
+    suppressed_trips = 0
+    while True:
+        # 最靠左的不足 k 非空桶（确定性的处理顺序，结果与录入顺序无关）
+        i = next((j for j, c in enumerate(comps)
+                  if len(c["cards"]) < k), None)
+        if i is None:
+            break
+        cur = comps[i]
+        left = comps[i - 1] if i > 0 else None
+        right = comps[i + 1] if i + 1 < len(comps) else None
+        if left is None and right is None:
+            # 已无相邻非空桶仍不足 k：抑制，不输出该组件任何明细。
+            # 统计被抑制组件覆盖的初始非空桶数（纯聚合数量，不含明细）。
+            suppressed_buckets += cur["buckets"]
+            suppressed_trips += cur["trips"]
+            del comps[i]
+            continue
+        # 合并后跨度（秒）：并入左邻 = 左邻起点 → 当前组件终点；
+        # 并入右邻 = 当前组件起点 → 右邻终点。同分优先左邻（更早邻桶）。
+        left_span = ((cur["end"] - left["start"]).total_seconds()
+                     if left is not None else None)
+        right_span = ((right["end"] - cur["start"]).total_seconds()
+                      if right is not None else None)
+        if right is None or (left is not None and left_span <= right_span):
+            left["cards"] |= cur["cards"]
+            left["trips"] += cur["trips"]
+            left["buckets"] += cur["buckets"]
+            left["end"] = cur["end"]
+            del comps[i]
+        else:
+            cur["cards"] |= right["cards"]
+            cur["trips"] += right["trips"]
+            cur["buckets"] += right["buckets"]
+            cur["end"] = right["end"]
+            del comps[i + 1]
+    return comps, suppressed_buckets, suppressed_trips
+
+
+def od_flow_publish(stations: list[Station],
+                    fares: list[Fare],
+                    records: list[Swipe],
+                    cfg: Config,
+                    start_day, end_day,
+                    bucket_minutes, k) -> OdFlowPublish:
+    """匿名客流 OD 发布（全程只读：不改记录、配置或账单）。
+
+    仅从**已保存且可完整配对**的记录生成「进站 → 出站」聚合：
+    - 用户选择运营日起止（闭区间，按进站时刻归属运营日）、初始时间桶
+      （15/30/60 分钟，按自然日整点对齐）与匿名阈值 k（2～50）；
+    - 以（运营日, 进站站点, 出站站点, 初始桶）分组，每桶统计行程数与
+      去重卡数；每个运营日、OD 内以去重卡数判定是否达到 k；
+    - 低于 k 的非空桶反复与前后相邻**非空**桶合并：优先合并后跨度更小
+      者，同分选更早邻桶；禁止跨运营日 / 跨 OD 合并；已无邻桶仍不足 k
+      则抑制；
+    - 发布结果只含最终区间起止（桶粒度）、行程数与去重卡数；抑制项只
+      汇总数量，绝不泄露卡号、原始行号或单条时刻；
+    - 配对 / 时间类错误（MISSING_ENTRY / MISSING_EXIT / TIME_REVERSED /
+      DUPLICATE_SWIPE）与参数非法（CONFIG_BAD）沿用 verify() 的原有
+      定位错误返回且不产出报表；未知站点与票价缺项不阻断
+      （聚合与分区、票价无关）。
+    """
+    errors: list[dict] = []
+    start_text, e1 = _parse_od_day(start_day, "起始日期")
+    end_text, e2 = _parse_od_day(end_day, "结束日期")
+    if e1 is not None:
+        errors.append(e1)
+    if e2 is not None:
+        errors.append(e2)
+    if not _is_int_value(bucket_minutes) \
+            or int(bucket_minutes) not in OD_BUCKET_CHOICES:
+        errors.append(_err(
+            "CONFIG_BAD",
+            f"初始时间桶必须是 {OD_BUCKET_CHOICES} 之一（分钟），"
+            f"实际：{bucket_minutes!r}"))
+    if not _is_int_value(k) or not (OD_K_MIN <= int(k) <= OD_K_MAX):
+        errors.append(_err(
+            "CONFIG_BAD",
+            f"匿名阈值 k 必须是 {OD_K_MIN}～{OD_K_MAX} 之间的整数，"
+            f"实际：{k!r}"))
+    if start_text is not None and end_text is not None \
+            and start_text > end_text:
+        errors.append(_err(
+            "CONFIG_BAD",
+            f"运营日起始日期不能晚于结束日期：{start_text} ～ {end_text}"))
+    if errors:
+        return OdFlowPublish(ok=False, errors=errors)
+    bucket_minutes = int(bucket_minutes)
+    k = int(k)
+
+    # 复用 verify() 的配对结果；配对 / 时间类错误与配置错误阻断发布，
+    # 未知站点、票价缺项不阻断（trips 仍由 verify 完整带出）。
+    result = verify(stations, fares, records, cfg)
+    if not result.ok:
+        blocking = [e for e in result.errors
+                    if e.get("code") in _OD_PUBLISH_BLOCKING_CODES]
+        if blocking:
+            return OdFlowPublish(ok=False, errors=result.errors)
+
+    # (运营日, 进站站点, 出站站点) -> {桶起点: {cards: set, trips: n}}
+    groups: dict[tuple[str, str, str],
+                 dict[datetime, dict]] = {}
+    total_trips = 0
+    for card, _seq, sw_in, sw_out in result.trips:
+        day = operating_day(sw_in.t, cfg.day_split_hour)
+        if not (start_text <= day <= end_text):
+            continue  # 运营日范围之外的行程不参与发布
+        total_trips += 1
+        bs = _od_bucket_start(sw_in.t, bucket_minutes)
+        bucket = groups.setdefault(
+            (day, sw_in.station, sw_out.station), {}
+        ).setdefault(bs, {"cards": set(), "trips": 0})
+        bucket["cards"].add(card)
+        bucket["trips"] += 1
+
+    rows: list[dict] = []
+    suppressed_buckets = 0
+    suppressed_trips = 0
+    days: set[str] = set()
+    ods: set[tuple[str, str]] = set()
+    for (day, entry_st, exit_st), buckets in groups.items():
+        days.add(day)
+        ods.add((entry_st, exit_st))
+        components = [{
+            "start": bs,
+            "end": bs + timedelta(minutes=bucket_minutes),
+            "cards": data["cards"],
+            "trips": data["trips"],
+            "buckets": 1,
+        } for bs, data in sorted(buckets.items())]
+        alive, sb, st = _merge_od_buckets(components, k)
+        suppressed_buckets += sb
+        suppressed_trips += st
+        for c in alive:
+            span_minutes = int(
+                (c["end"] - c["start"]).total_seconds() // 60)
+            rows.append({
+                "operating_day": day,
+                "entry_station": entry_st,
+                "exit_station": exit_st,
+                "start_time": c["start"].strftime(OD_TIME_FMT),
+                "end_time": c["end"].strftime(OD_TIME_FMT),
+                "bucket_minutes": bucket_minutes,
+                "span_minutes": span_minutes,
+                "merged_buckets": span_minutes // bucket_minutes,
+                "trip_count": c["trips"],
+                "card_count": len(c["cards"]),
+            })
+
+    rows.sort(key=lambda r: (r["operating_day"], r["entry_station"],
+                             r["exit_station"], r["start_time"]))
+
+    return OdFlowPublish(
+        ok=True,
+        start_day=start_text,
+        end_day=end_text,
+        bucket_minutes=bucket_minutes,
+        k=k,
+        day_split_hour=cfg.day_split_hour,
+        trip_count=total_trips,
+        day_count=len(days),
+        od_count=len(ods),
+        row_count=len(rows),
+        suppressed_bucket_count=suppressed_buckets,
+        suppressed_trip_count=suppressed_trips,
+        rows=rows,
+    )
